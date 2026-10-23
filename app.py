@@ -1,6 +1,7 @@
 """표준 라이브러리만 사용하는 간단한 방명록 웹 서버."""
 
 from contextlib import closing
+from dataclasses import dataclass, field
 from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import os
@@ -16,6 +17,22 @@ MAX_FORM_BYTES = 8192
 VISIBLE_ENTRY_LIMIT = 50
 
 
+@dataclass
+class GuestbookEntry:
+    id: int
+    name: str
+    message: str
+    created_at: str
+    parent_id: int | None = None
+    replies: list["GuestbookEntry"] = field(default_factory=list)
+
+
+def connect_database(db_path: Path) -> sqlite3.Connection:
+    connection = sqlite3.connect(db_path, timeout=5)
+    connection.execute("PRAGMA foreign_keys = ON")
+    return connection
+
+
 def initialize_database(db_path: Path) -> None:
     """방명록 글을 저장하는 단일 테이블을 준비한다."""
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -26,35 +43,92 @@ def initialize_database(db_path: Path) -> None:
                 id INTEGER PRIMARY KEY,
                 name TEXT NOT NULL,
                 message TEXT NOT NULL,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                parent_id INTEGER REFERENCES guestbook_entries(id)
             )
             """
         )
+        columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(guestbook_entries)")
+        }
+        if "parent_id" not in columns:
+            connection.execute(
+                "ALTER TABLE guestbook_entries "
+                "ADD COLUMN parent_id INTEGER REFERENCES guestbook_entries(id)"
+            )
         connection.commit()
 
 
-def add_entry(db_path: Path, name: str, message: str) -> None:
-    """검증된 글을 SQL 매개변수로 저장한다."""
-    with closing(sqlite3.connect(db_path, timeout=5)) as connection:
+def add_entry(
+    db_path: Path,
+    name: str,
+    message: str,
+    parent_id: int | None = None,
+) -> None:
+    """검증된 글이나 원글의 답글을 SQL 매개변수로 저장한다."""
+    with closing(connect_database(db_path)) as connection:
         with connection:
             connection.execute(
-                "INSERT INTO guestbook_entries (name, message) VALUES (?, ?)",
-                (name, message),
+                """
+                INSERT INTO guestbook_entries (name, message, parent_id)
+                VALUES (?, ?, ?)
+                """,
+                (name, message, parent_id),
             )
 
 
-def get_recent_entries(db_path: Path) -> list[tuple[int, str, str, str]]:
-    """최신 글 50개를 ID 내림차순으로 읽는다."""
-    with closing(sqlite3.connect(db_path, timeout=5)) as connection:
-        return connection.execute(
+def is_root_entry(db_path: Path, entry_id: int) -> bool:
+    """대댓글이 아닌 원글인지 확인한다."""
+    with closing(connect_database(db_path)) as connection:
+        return (
+            connection.execute(
+                "SELECT 1 FROM guestbook_entries "
+                "WHERE id = ? AND parent_id IS NULL",
+                (entry_id,),
+            ).fetchone()
+            is not None
+        )
+
+
+def get_recent_entries(db_path: Path) -> list[GuestbookEntry]:
+    """최신 원글 50개와 각 원글의 답글을 읽는다."""
+    with closing(connect_database(db_path)) as connection:
+        rows = connection.execute(
             """
-            SELECT id, name, message, created_at
-            FROM guestbook_entries
-            ORDER BY id DESC
-            LIMIT ?
+            WITH recent_roots AS (
+                SELECT id
+                FROM guestbook_entries
+                WHERE parent_id IS NULL
+                ORDER BY id DESC
+                LIMIT ?
+            )
+            SELECT entry.id, entry.name, entry.message, entry.created_at,
+                   entry.parent_id, roots.id AS root_id
+            FROM recent_roots AS roots
+            JOIN guestbook_entries AS entry
+              ON entry.id = roots.id OR entry.parent_id = roots.id
+            ORDER BY roots.id DESC,
+                     CASE WHEN entry.parent_id IS NULL THEN 0 ELSE 1 END,
+                     entry.id ASC
             """,
             (VISIBLE_ENTRY_LIMIT,),
         ).fetchall()
+
+    roots: dict[int, GuestbookEntry] = {}
+    for entry_id, name, message, created_at, parent_id, root_id in rows:
+        if parent_id is None:
+            roots[entry_id] = GuestbookEntry(
+                entry_id,
+                name,
+                message,
+                created_at,
+            )
+        else:
+            roots[root_id].replies.append(
+                GuestbookEntry(entry_id, name, message, created_at, parent_id)
+            )
+    return list(roots.values())
 
 
 class GuestbookHTTPServer(ThreadingHTTPServer):
@@ -75,9 +149,13 @@ class GuestbookRequestHandler(BaseHTTPRequestHandler):
 
         entries = get_recent_entries(self.server.db_path)
         query = parse_qs(urlsplit(self.path).query)
+        notice_text = {
+            "1": "새 글을 남겼습니다.",
+            "reply": "댓글을 남겼습니다.",
+        }.get(query.get("saved", [""])[0])
         notice = (
-            '<p class="notice" role="status">방명록을 저장했습니다.</p>'
-            if query.get("added") == ["1"]
+            f'<p class="notice" role="status">{notice_text}</p>'
+            if notice_text
             else ""
         )
         self._send_page(200, self._render_page(entries, notice))
@@ -112,6 +190,18 @@ class GuestbookRequestHandler(BaseHTTPRequestHandler):
             self._show_error(400, "입력은 UTF-8 형식이어야 합니다.")
             return
 
+        raw_parent_id = form.get("parent_id", [""])[0].strip()
+        parent_id = None
+        if raw_parent_id:
+            try:
+                parent_id = int(raw_parent_id)
+            except ValueError:
+                self._show_error(400, "답글을 달 글을 확인할 수 없습니다.")
+                return
+            if parent_id < 1 or not is_root_entry(self.server.db_path, parent_id):
+                self._show_error(400, "답글은 원글에만 작성할 수 있습니다.")
+                return
+
         name = form.get("name", [""])[0].strip()
         message = form.get("message", [""])[0].strip()
         if not name or len(name) > MAX_NAME_LENGTH:
@@ -124,39 +214,74 @@ class GuestbookRequestHandler(BaseHTTPRequestHandler):
             )
             return
 
-        add_entry(self.server.db_path, name, message)
+        add_entry(self.server.db_path, name, message, parent_id)
         self.send_response(303)
-        self.send_header("Location", "/?added=1")
+        self.send_header("Location", "/?saved=reply" if parent_id else "/?saved=1")
         self.send_header("Content-Length", "0")
         self.end_headers()
 
     def _show_error(self, status: int, message: str) -> None:
         error_markup = f'<p class="error" role="alert">{escape(message)}</p>'
-        self._send_page(status, self._render_page([], error_markup))
+        self._send_page(
+            status,
+            self._render_page(
+                get_recent_entries(self.server.db_path),
+                error_markup,
+            ),
+        )
 
     def _render_page(
         self,
-        entries: list[tuple[int, str, str, str]],
+        entries: list[GuestbookEntry],
         notice: str,
     ) -> str:
         if entries:
-            entry_markup = "\n".join(
-                (
-                    '<article class="entry">'
-                    f"<h2>{escape(name)}</h2>"
-                    f'<time datetime="{escape(created_at, quote=True)}">{escape(created_at)}</time>'
-                    f'<p class="message">{escape(message)}</p>'
-                    "</article>"
-                )
-                for _entry_id, name, message, created_at in entries
-            )
+            entry_markup = "\n".join(self._render_entry(entry) for entry in entries)
         else:
-            entry_markup = '<p class="empty">아직 등록된 글이 없습니다. 첫 글을 남겨보세요.</p>'
+            entry_markup = (
+                '<p class="empty">아직 등록된 글이 없습니다. '
+                "첫 글을 남겨보세요.</p>"
+            )
 
         template = HTML_PATH.read_text(encoding="utf-8")
         return (
             template.replace("{{notice}}", notice)
             .replace("{{entries}}", entry_markup)
+        )
+
+    def _render_entry(self, entry: GuestbookEntry) -> str:
+        reply_markup = "\n".join(
+            (
+                '<article class="reply">'
+                f'<div class="entry-heading"><h3>{escape(reply.name)}</h3>'
+                f'<time datetime="{escape(reply.created_at, quote=True)}">'
+                f"{escape(reply.created_at)}</time></div>"
+                f'<p class="message">{escape(reply.message)}</p>'
+                "</article>"
+            )
+            for reply in entry.replies
+        )
+        if not reply_markup:
+            reply_markup = '<p class="reply-empty">첫 댓글을 남겨보세요.</p>'
+
+        return (
+            '<article class="entry">'
+            '<div class="entry-heading">'
+            f'<h3>{escape(entry.name)}</h3>'
+            f'<time datetime="{escape(entry.created_at, quote=True)}">'
+            f"{escape(entry.created_at)}</time>"
+            "</div>"
+            f'<p class="message">{escape(entry.message)}</p>'
+            '<details class="reply-box"><summary>댓글 남기기</summary>'
+            '<form method="post" action="/">'
+            f'<input type="hidden" name="parent_id" value="{entry.id}">'
+            '<label>이름<input name="name" type="text" maxlength="40" required></label>'
+            '<label>댓글<textarea name="message" rows="2" maxlength="1000" '
+            'required></textarea></label>'
+            '<button type="submit">댓글 등록</button>'
+            "</form></details>"
+            f'<div class="replies" aria-label="댓글">{reply_markup}</div>'
+            "</article>"
         )
 
     def _send_page(self, status: int, content: str) -> None:
