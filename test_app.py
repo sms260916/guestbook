@@ -1,20 +1,31 @@
 import http.client
-from contextlib import closing
+import os
+from uuid import uuid4
+from unittest.mock import patch
 from pathlib import Path
-import sqlite3
-import tempfile
 import threading
 import unittest
 from urllib.parse import urlencode
 
-from app import create_server
+from app import create_server, connect_database, DatabaseSettings
 
 
+@unittest.skipUnless(os.environ.get("GUESTBOOK_TEST_POSTGRES") == "1", "별도 PostgreSQL 테스트 DB 필요")
 class GuestbookAppTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.temp_dir = tempfile.TemporaryDirectory()
-        self.db_path = Path(self.temp_dir.name) / "guestbook.sqlite3"
-        self.server = create_server(self.db_path, "127.0.0.1", 0)
+        self.settings = DatabaseSettings.from_env()
+        self.schema = "guestbook_test_" + uuid4().hex
+        self.real_connect = connect_database
+        with self.real_connect(self.settings) as connection:
+            connection.execute(f'CREATE SCHEMA "{self.schema}"')
+        def isolated_connect(settings):
+            connection = self.real_connect(settings)
+            connection.execute(f'SET search_path TO "{self.schema}"')
+            return connection
+        self.connect_patch = patch("app.connect_database", side_effect=isolated_connect)
+        self.connect_patch.start()
+        self.addCleanup(self.clean_database)
+        self.server = create_server(self.settings, "127.0.0.1", 0)
         self.server_thread = threading.Thread(
             target=self.server.serve_forever,
             daemon=True,
@@ -26,7 +37,15 @@ class GuestbookAppTests(unittest.TestCase):
         self.server.shutdown()
         self.server.server_close()
         self.server_thread.join()
-        self.temp_dir.cleanup()
+
+    def clean_database(self):
+        self.connect_patch.stop()
+        with self.real_connect(self.settings) as connection:
+            connection.execute(f'DROP SCHEMA "{self.schema}" CASCADE')
+
+    def server_connection(self):
+        import app
+        return app.connect_database(self.settings)
 
     def request(
         self,
@@ -86,7 +105,7 @@ class GuestbookAppTests(unittest.TestCase):
     def test_reply_is_saved_under_root_and_nested_reply_is_rejected(self) -> None:
         status, _, _ = self.post_entry("원글 작성자", "원글 내용")
         self.assertEqual(status, 303)
-        with closing(sqlite3.connect(self.db_path)) as connection:
+        with self.server_connection() as connection:
             root_id = connection.execute(
                 "SELECT id FROM guestbook_entries WHERE parent_id IS NULL"
             ).fetchone()[0]
@@ -100,64 +119,41 @@ class GuestbookAppTests(unittest.TestCase):
         self.assertIn("첫 댓글", body)
         self.assertIn("댓글을 남겼습니다.", body)
 
-        with closing(sqlite3.connect(self.db_path)) as connection:
+        with self.server_connection() as connection:
             reply_id = connection.execute(
-                "SELECT id FROM guestbook_entries WHERE parent_id = ?",
+                "SELECT id FROM guestbook_entries WHERE parent_id = %s",
                 (root_id,),
             ).fetchone()[0]
         status, _, body = self.post_entry("다른 사람", "대댓글", reply_id)
         self.assertEqual(status, 400)
         self.assertIn("답글은 원글에만 작성할 수 있습니다.", body)
-        with closing(sqlite3.connect(self.db_path)) as connection:
+        with self.server_connection() as connection:
             count = connection.execute(
                 "SELECT COUNT(*) FROM guestbook_entries"
             ).fetchone()[0]
         self.assertEqual(count, 2)
 
-    def test_previous_database_is_migrated_without_losing_entries(self) -> None:
-        old_db_path = Path(self.temp_dir.name) / "previous.sqlite3"
-        with closing(sqlite3.connect(old_db_path)) as connection:
-            connection.execute(
-                """
-                CREATE TABLE guestbook_entries (
-                    id INTEGER PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    message TEXT NOT NULL,
-                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-                )
-                """
-            )
-            connection.execute(
-                "INSERT INTO guestbook_entries (name, message) VALUES (?, ?)",
-                ("이전 작성자", "이전 글"),
-            )
-            connection.commit()
+    def test_initialization_preserves_existing_entries(self):
+        from app import initialize_database, add_entry, get_recent_entries
+        add_entry(self.settings, "이전 작성자", "이전 글")
+        initialize_database(self.settings)
+        self.assertEqual(get_recent_entries(self.settings)[0].message, "이전 글")
 
-        migrated_server = create_server(old_db_path, "127.0.0.1", 0)
-        migrated_server.server_close()
-        with closing(sqlite3.connect(old_db_path)) as connection:
-            columns = {
-                row[1]
-                for row in connection.execute(
-                    "PRAGMA table_info(guestbook_entries)"
-                )
-            }
-            tables = connection.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table'"
-            ).fetchall()
-            existing_entry = connection.execute(
-                "SELECT name, message, parent_id FROM guestbook_entries"
-            ).fetchone()
-        self.assertIn("parent_id", columns)
-        self.assertEqual(tables, [("guestbook_entries",)])
-        self.assertEqual(existing_entry, ("이전 작성자", "이전 글", None))
+    def test_failed_transaction_rolls_back(self):
+        import psycopg
+        with self.assertRaises(psycopg.errors.ForeignKeyViolation):
+            with self.server_connection() as connection:
+                connection.execute("INSERT INTO guestbook_entries (name, message) VALUES (%s, %s)", ("롤백", "첫 글"))
+                connection.execute("INSERT INTO guestbook_entries (name, message, parent_id) VALUES (%s, %s, %s)", ("실패", "댓글", 999999))
+        with self.server_connection() as connection:
+            self.assertEqual(connection.execute("SELECT count(*) FROM guestbook_entries").fetchone()[0], 0)
 
     def test_invalid_entry_is_rejected_without_saving(self) -> None:
         status, _, body = self.post_entry(" ", "내용")
 
         self.assertEqual(status, 400)
         self.assertIn("이름은 1~40자로 입력해 주세요.", body)
-        with closing(sqlite3.connect(self.db_path)) as connection:
+        with self.server_connection() as connection:
             count = connection.execute(
                 "SELECT COUNT(*) FROM guestbook_entries"
             ).fetchone()[0]
@@ -175,9 +171,9 @@ class GuestbookAppTests(unittest.TestCase):
         self.assertIn("prefers-reduced-motion", body)
         self.assertIn('class="leaves"', body)
 
-        with closing(sqlite3.connect(self.db_path)) as connection:
+        with self.server_connection() as connection:
             tables = connection.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table'"
+                "SELECT tablename FROM pg_tables WHERE schemaname = current_schema()"
             ).fetchall()
             count = connection.execute(
                 "SELECT COUNT(*) FROM guestbook_entries"
